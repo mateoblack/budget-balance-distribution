@@ -1,0 +1,16 @@
+{
+  "app": "python app.py",
+  "context": {
+    "account_id": "REPLACE_WITH_ACCOUNT_ID",
+    "region": "us-east-1",
+    "config_table_name": "budget-config",
+    "audit_table_name": "budget-audit",
+    "@aws-cdk/aws-apigateway:usagePlanKeyOrderInsensitiveId": true,
+    "@aws-cdk/core:stackRelativeExports": true,
+    "@aws-cdk/aws-rds:lowercaseDbIdentifier": true,
+    "@aws-cdk/aws-lambda:recognizeVersionProps": true,
+    "@aws-cdk/aws-cloudfront:defaultSecurityPolicyTLSv1.2_2021": true,
+    "@aws-cdk/aws-apigateway:requestValidatorUniqueId": true,
+    "@aws-cdk/core:target-partitions": ["aws", "aws-cn"]
+  }
+}
