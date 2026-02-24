@@ -17,12 +17,14 @@ REQUIRED IAM PERMISSIONS:
   - ce:UpdateCostCategoryDefinition
   - dynamodb:GetItem, Query (config table)
   - dynamodb:PutItem, UpdateItem (audit table for idempotency + audit records)
+  - s3:GetObject (plan artifact bucket, if PLAN_ARTIFACT_BUCKET is set)
 
 ENVIRONMENT VARIABLES:
   - CONFIG_TABLE_NAME: DynamoDB table for configuration
   - AUDIT_TABLE_NAME: DynamoDB table for audit logs and idempotency
   - COST_CATEGORY_ARN: ARN of Cost Category to update (must be set at deploy time)
   - DRY_RUN: "true" (default) or "false" - controls write behavior
+  - PLAN_ARTIFACT_BUCKET: S3 bucket name for plan artifacts written by Discovery Lambda
   - POWERTOOLS_SERVICE_NAME: Service name for logging (default: "enforcement")
   - POWERTOOLS_LOG_LEVEL: Logging level (default: "INFO")
 """
@@ -101,7 +103,9 @@ CONFIG_TABLE_NAME = os.environ.get("CONFIG_TABLE_NAME", "")
 AUDIT_TABLE_NAME = os.environ.get("AUDIT_TABLE_NAME", "")
 COST_CATEGORY_ARN = os.environ.get("COST_CATEGORY_ARN", "")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+PLAN_ARTIFACT_BUCKET = os.environ.get("PLAN_ARTIFACT_BUCKET", "")
 LOOKBACK_DAYS = 30  # Match discovery Lambda default
+MAX_ARTIFACT_AGE_HOURS = 26  # 26h allows for scheduling drift (Discovery at 2:00 AM, Enforcement at 2:30 AM)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +203,78 @@ def get_per_account_discount_usage(
     except Exception as e:
         logger.error("Failed to get per-account discount usage", extra={"error": str(e)})
         raise
+
+
+# ---------------------------------------------------------------------------
+# S3 Plan Artifact Loader (Phase B gate)
+# ---------------------------------------------------------------------------
+
+def load_plan_artifact(s3_client) -> dict | None:
+    """
+    Load proposed changes from the S3 plan artifact written by Discovery Lambda.
+
+    Returns None in these cases (caller falls back to direct CE computation):
+    - PLAN_ARTIFACT_BUCKET env var not set
+    - S3 object does not exist (Discovery hasn't run yet)
+    - Artifact is older than MAX_ARTIFACT_AGE_HOURS (stale — Discovery may have failed)
+    - Any S3 or JSON parsing error
+
+    Returns the artifact dict if loaded successfully.
+    """
+    if not PLAN_ARTIFACT_BUCKET:
+        logger.info("PLAN_ARTIFACT_BUCKET not set — skipping S3 artifact load")
+        return None
+
+    try:
+        response = s3_client.get_object(
+            Bucket=PLAN_ARTIFACT_BUCKET,
+            Key="proposed_changes/latest.json",
+        )
+        artifact = json.loads(response["Body"].read())
+
+        # Check artifact freshness — warn if older than MAX_ARTIFACT_AGE_HOURS
+        generated_at_str = artifact.get("generated_at", "")
+        if generated_at_str:
+            generated_at = datetime.fromisoformat(generated_at_str)
+            # Normalize to UTC if no timezone info
+            if generated_at.tzinfo is None:
+                generated_at = generated_at.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600
+            if age_hours > MAX_ARTIFACT_AGE_HOURS:
+                logger.warning(
+                    "Plan artifact is stale — falling back to direct CE computation",
+                    extra={
+                        "age_hours": round(age_hours, 1),
+                        "generated_at": generated_at_str,
+                        "max_age_hours": MAX_ARTIFACT_AGE_HOURS,
+                    }
+                )
+                return None
+
+        logger.info(
+            "Plan artifact loaded from S3",
+            extra={
+                "bucket": PLAN_ARTIFACT_BUCKET,
+                "generated_at": generated_at_str,
+                "proposed_disable_count": len(artifact.get("proposed_disables", [])),
+                "proposed_enable_count": len(artifact.get("proposed_enables", [])),
+            }
+        )
+        return artifact
+
+    except s3_client.exceptions.NoSuchKey:
+        logger.warning(
+            "Plan artifact not found in S3 — Discovery Lambda may not have run yet. "
+            "Falling back to direct CE computation.",
+            extra={"bucket": PLAN_ARTIFACT_BUCKET, "key": "proposed_changes/latest.json"}
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            "Failed to load plan artifact from S3 — falling back to direct CE computation",
+            extra={"error": str(e), "bucket": PLAN_ARTIFACT_BUCKET}
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -308,21 +384,42 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "message": warning_msg
         }
 
-    # --- Step 3: Query Cost Explorer for per-account discount usage ---
-    try:
-        per_account_usage = get_per_account_discount_usage(start_date, end_date)
-        logger.info(
-            "Per-account usage data retrieved",
-            extra={"usage_data_count": len(per_account_usage)}
-        )
-    except Exception as e:
-        error_msg = f"Failed to query Cost Explorer: {str(e)}"
-        logger.error(error_msg, extra={"error": str(e)})
-        return {
-            "status": "ERROR",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "message": error_msg
-        }
+    # --- Step 3: Try to load plan artifact from S3 (Phase B gate) ---
+    # Falls back to direct CE computation if artifact is missing, stale, or unavailable
+    s3_client = _get_client("s3")
+    plan_artifact = load_plan_artifact(s3_client)
+
+    if plan_artifact is not None:
+        # Use Discovery's pre-computed analysis from S3 artifact
+        logger.info("Using S3 plan artifact for enforcement decisions")
+        per_account_usage = plan_artifact.get("accounts", [])
+        # Map artifact account format to enforcement format
+        # Artifact has: account_id, discount_benefit, drain_score, etc.
+        # Enforcement expects: account_id, estimated_discount_benefit
+        for acct in per_account_usage:
+            if "estimated_discount_benefit" not in acct:
+                acct["estimated_discount_benefit"] = acct.get("discount_benefit", 0.0)
+        data_as_of = plan_artifact.get("data_as_of", "")
+        artifact_source = "s3"
+    else:
+        # Fallback: direct CE computation (original v1.0 behavior)
+        logger.info("Falling back to direct CE computation for enforcement decisions")
+        try:
+            per_account_usage = get_per_account_discount_usage(start_date, end_date)
+            logger.info(
+                "Per-account usage data retrieved from CE",
+                extra={"usage_data_count": len(per_account_usage)}
+            )
+        except Exception as e:
+            error_msg = f"Failed to query Cost Explorer: {str(e)}"
+            logger.error(error_msg, extra={"error": str(e)})
+            return {
+                "status": "ERROR",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": error_msg
+            }
+        data_as_of = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        artifact_source = "ce_direct"
 
     if not per_account_usage:
         warning_msg = "No per-account usage data returned from Cost Explorer"
@@ -381,6 +478,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             enable_list=enable_list,
             disable_list=disable_list,
             execution_result="DRY_RUN",
+            data_as_of=data_as_of,
         )
 
         return {
@@ -390,6 +488,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "disable_count": len(disable_list),
             "enabled_accounts": enable_list,
             "disabled_accounts": disable_list,
+            "artifact_source": artifact_source,
         }
 
     # Step 6b: Execute mode
@@ -442,6 +541,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             snapshot_id=snapshot_id,
             effective_start=effective_start,
             previous_state=previous_state,
+            data_as_of=data_as_of,
         )
 
         return {
@@ -451,6 +551,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "disable_count": len(disable_list),
             "effective_start": effective_start,
             "snapshot_id": snapshot_id,
+            "artifact_source": artifact_source,
         }
 
     except Exception as e:
@@ -468,6 +569,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 disable_list=disable_list,
                 execution_result="ERROR",
                 error_message=str(e),
+                data_as_of=data_as_of,
             )
         except Exception as audit_err:
             logger.error("Failed to write error audit record", extra={"audit_error": str(audit_err)})
