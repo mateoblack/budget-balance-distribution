@@ -19,6 +19,7 @@ from aws_cdk import (
     aws_cloudwatch as cloudwatch,
     aws_sns as sns,
     aws_cloudwatch_actions as cw_actions,
+    aws_s3 as s3,
 )
 from aws_cdk.aws_lambda_python_alpha import PythonFunction
 from constructs import Construct
@@ -95,6 +96,25 @@ class InfrastructureStack(Stack):
             projection_type=dynamodb.ProjectionType.ALL,
         )
 
+        # Plan Artifact Bucket
+        # Discovery Lambda writes proposed_changes.json here; Enforcement Lambda reads it
+        # Human-reviewable gate between discovery and enforcement phases
+        self.plan_artifact_bucket = s3.Bucket(
+            self, "PlanArtifactBucket",
+            versioned=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireOldArtifacts",
+                    expiration=Duration.days(90),
+                    noncurrent_version_expiration=Duration.days(30),
+                )
+            ],
+            removal_policy=RemovalPolicy.RETAIN,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+        )
+
         # Discovery Role
         # Read-only execution role for Discovery Lambda (Phase 2)
         self.discovery_role = iam.Role(
@@ -137,6 +157,9 @@ class InfrastructureStack(Stack):
         # Grant write access to audit table for idempotency records
         self.audit_table.grant_write_data(self.discovery_role)
 
+        # Grant Discovery Lambda write access to plan artifact bucket
+        self.plan_artifact_bucket.grant_put(self.discovery_role)
+
         # Add Lambda basic execution policy for CloudWatch Logs
         self.discovery_role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name(
@@ -152,7 +175,7 @@ class InfrastructureStack(Stack):
             entry="lambda/discovery",
             index="index.py",
             handler="lambda_handler",
-            timeout=Duration.minutes(5),
+            timeout=Duration.minutes(10),
             memory_size=512,
             role=self.discovery_role,
             environment={
@@ -163,18 +186,22 @@ class InfrastructureStack(Stack):
                 "LOOKBACK_DAYS": "30",
                 "THRESHOLD_PCT": "120",
                 "DRY_RUN": "true",
+                "PLAN_ARTIFACT_BUCKET": self.plan_artifact_bucket.bucket_name,
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
 
         # EventBridge Schedule
-        # Trigger Discovery Lambda daily at 2:00 AM UTC
+        # Trigger Discovery Lambda daily at configurable time (default 2:00 AM UTC)
+        # Override via CDK context: -c discovery_hour=3 -c discovery_minute=30
+        discovery_hour = self.node.try_get_context("discovery_hour") or "2"
+        discovery_minute = self.node.try_get_context("discovery_minute") or "0"
         self.discovery_schedule = events.Rule(
             self, "DiscoverySchedule",
             description="Trigger Discovery Lambda daily at 2:00 AM UTC",
             schedule=events.Schedule.cron(
-                minute="0",
-                hour="2",
+                minute=discovery_minute,
+                hour=discovery_hour,
                 month="*",
                 week_day="*",
                 year="*",
@@ -204,6 +231,9 @@ class InfrastructureStack(Stack):
 
         # Grant write access to audit table (PutItem)
         self.audit_table.grant_write_data(self.enforcement_role)
+
+        # Grant Enforcement Lambda read access to plan artifact bucket
+        self.plan_artifact_bucket.grant_read(self.enforcement_role)
 
         # Add Cost Explorer READ access for enforcement
         self.enforcement_role.add_to_policy(
@@ -243,7 +273,7 @@ class InfrastructureStack(Stack):
             entry="lambda/enforcement",
             index="index.py",
             handler="lambda_handler",
-            timeout=Duration.minutes(5),
+            timeout=Duration.minutes(10),
             memory_size=512,
             role=self.enforcement_role,
             environment={
@@ -253,6 +283,7 @@ class InfrastructureStack(Stack):
                 "POWERTOOLS_SERVICE_NAME": "enforcement",
                 "POWERTOOLS_LOG_LEVEL": "INFO",
                 "DRY_RUN": "true",
+                "PLAN_ARTIFACT_BUCKET": self.plan_artifact_bucket.bucket_name,
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
@@ -379,12 +410,12 @@ class InfrastructureStack(Stack):
             self,
             "DiscoveryLambdaDurationAlarm",
             alarm_name="BudgetBalanceDistribution-DiscoveryLambdaDuration",
-            alarm_description="Discovery Lambda duration approaching timeout (>240s of 300s)",
+            alarm_description="Discovery Lambda duration approaching timeout (>510s of 600s)",
             metric=self.discovery_lambda.metric_duration(
                 statistic=cloudwatch.Stats.MAXIMUM,
                 period=Duration.minutes(5),
             ),
-            threshold=240000,  # 240 seconds in milliseconds
+            threshold=510000,  # 510 seconds in milliseconds (85% of 10min)
             evaluation_periods=1,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
@@ -397,12 +428,12 @@ class InfrastructureStack(Stack):
             self,
             "EnforcementLambdaDurationAlarm",
             alarm_name="BudgetBalanceDistribution-EnforcementLambdaDuration",
-            alarm_description="Enforcement Lambda duration approaching timeout (>240s of 300s)",
+            alarm_description="Enforcement Lambda duration approaching timeout (>510s of 600s)",
             metric=self.enforcement_lambda.metric_duration(
                 statistic=cloudwatch.Stats.MAXIMUM,
                 period=Duration.minutes(5),
             ),
-            threshold=240000,  # 240 seconds in milliseconds
+            threshold=510000,  # 510 seconds in milliseconds (85% of 10min)
             evaluation_periods=1,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
@@ -843,4 +874,11 @@ class InfrastructureStack(Stack):
                 f"Rule: {self.enforcement_execute_schedule.rule_name}"
             ),
             description="Validation steps before enabling production enforcement",
+        )
+
+        CfnOutput(
+            self,
+            "PlanArtifactBucketName",
+            value=self.plan_artifact_bucket.bucket_name,
+            description="S3 bucket for plan artifacts (proposed_changes.json)",
         )
