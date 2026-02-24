@@ -582,8 +582,9 @@ def compute_fair_share_analysis(
             "fair_share": round(fair_share, 2),
             "pct_of_fair_share": round(pct_of_fair, 1),
             "drain_score": drain_score,           # normalized score vs fair share
-            "ri_benefit": round(ri_benefit, 2),   # approximate RI attribution
-            "sp_benefit": round(sp_benefit, 2),   # per-account SP benefit
+            "ri_benefit": round(ri_benefit, 2),   # approximate: total benefit minus SP benefit
+            "ri_benefit_is_approximate": True,    # SP is measured directly; RI is derived by subtraction
+            "sp_benefit": round(sp_benefit, 2),   # exact: from Savings Plans utilization API
             "over_threshold": benefit > threshold_amount,
         }
 

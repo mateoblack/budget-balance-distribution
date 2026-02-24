@@ -53,6 +53,17 @@ Budget Balanced Distribution automatically monitors AWS account spending and enf
 └─────────────────────────────────────────────┘
 ```
 
+### RI vs SP Attribution
+
+Discovery output includes per-account `ri_benefit` and `sp_benefit` fields. These are not symmetric:
+
+- **`sp_benefit`** — exact, sourced from the Savings Plans utilization API (`GetSavingsPlansUtilizationDetails`), which provides per-account SP attribution directly.
+- **`ri_benefit`** — approximate, derived by subtracting `sp_benefit` from total discount benefit. There is no Cost Explorer API that provides per-account RI attribution directly. The `ri_benefit_is_approximate: true` field in every discovery record flags this explicitly.
+
+For enforcement decisions the approximation is immaterial — total discount consumption (`discount_benefit`) is exact. The split only matters if you configure `fairness_metric: ri` or `fairness_metric: sp` to enforce against one discount type independently.
+
+---
+
 ## Phase A / Phase B Deployment Model
 
 The system ships with two operational modes separated by an explicit activation gate.
