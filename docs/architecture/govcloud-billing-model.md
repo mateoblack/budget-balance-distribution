@@ -122,12 +122,10 @@ Operators can confirm that GovCloud accounts appear correctly in Cost Explorer:
 
 ---
 
-## Open Questions
+## Validation Status
 
-**Pending empirical validation:** Do commercial paired account IDs show GovCloud workload costs in Cost Explorer for all account configurations?
+**Confirmed 2026-02-24:** GovCloud workload costs appear in Cost Explorer under the commercial paired account ID for this deployment's AWS Organization configuration.
 
-The research underlying this document indicates that GovCloud workload costs appear in Cost Explorer under the commercial paired account ID. However, this has not been empirically verified against the specific AWS Organization configuration for this deployment. If GovCloud charges do not appear under the expected commercial paired account IDs in Cost Explorer, the enforcement mechanism cannot function correctly.
+The commercial paired account IDs returned by `organizations:ListAccounts` correctly show GovCloud workload charges in Cost Explorer when filtered by Linked Account. The enforcement mechanism functions as designed — removing a commercial paired account ID from the `RISP_ENABLED` Cost Category rule correctly controls RISP sharing for its GovCloud workloads.
 
-See: `.planning/todos/pending/2026-02-13-validate-risp-group-sharing-actually-prevents-discount-application.md`
-
-Before enabling Phase B enforcement for GovCloud workloads, operators should verify that Cost Explorer correctly attributes GovCloud charges to the commercial paired account IDs by following the Verification Steps above.
+This was validated against the production AWS Organization. The `govcloud_billing_validated` flag in `.planning/config.json` is set to `true` to record this confirmation for auditors and future operators.
