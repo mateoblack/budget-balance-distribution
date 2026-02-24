@@ -369,3 +369,53 @@ class TestThresholdConfig:
         item = threshold.to_dynamodb_item()
         restored = ThresholdConfig.from_dynamodb_item(item)
         assert restored.absolute_amount == Decimal("5000.50")
+
+    def test_threshold_config_default_re_enable_threshold_pct(self):
+        """ThresholdConfig re_enable_threshold_pct defaults to None."""
+        t = ThresholdConfig(
+            threshold_id="t1",
+            group_id="g1",
+            threshold_type="fair_share",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        assert t.re_enable_threshold_pct is None
+
+    def test_threshold_config_default_fairness_metric(self):
+        """ThresholdConfig fairness_metric defaults to 'combined'."""
+        t = ThresholdConfig(
+            threshold_id="t1",
+            group_id="g1",
+            threshold_type="fair_share",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        assert t.fairness_metric == "combined"
+
+    def test_threshold_config_re_enable_threshold_pct_serializes(self):
+        """ThresholdConfig re_enable_threshold_pct serializes to DynamoDB item."""
+        t = ThresholdConfig(
+            threshold_id="t1",
+            group_id="g1",
+            threshold_type="fair_share",
+            re_enable_threshold_pct=Decimal("80"),
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        item = t.to_dynamodb_item()
+        assert "re_enable_threshold_pct" in item
+        assert item["re_enable_threshold_pct"] == "80"
+
+    def test_threshold_config_fairness_metric_sp_only(self):
+        """ThresholdConfig fairness_metric 'sp_only' is valid."""
+        t = ThresholdConfig(
+            threshold_id="t1",
+            group_id="g1",
+            threshold_type="fair_share",
+            fairness_metric="sp_only",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        assert t.fairness_metric == "sp_only"
+        item = t.to_dynamodb_item()
+        assert item["fairness_metric"] == "sp_only"

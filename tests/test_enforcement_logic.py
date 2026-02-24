@@ -193,6 +193,84 @@ class TestDetermineEnforcementActions:
         assert actions["disable"] == []
 
 
+class TestDetermineEnforcementActionsHysteresis:
+    """Test hysteresis band behavior in determine_enforcement_actions."""
+
+    def test_hysteresis_band_no_action(self):
+        """Account in hysteresis band (between re_enable and disable thresholds) gets no action."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "111111111111", "estimated_discount_benefit": 110.0},
+        ]
+        # disable at 120, re-enable at 80 — account at 110 is in the band
+        account_thresholds = {"111111111111": Decimal("120")}
+        account_re_enable_thresholds = {"111111111111": Decimal("80")}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds, account_re_enable_thresholds
+        )
+
+        assert "111111111111" not in result["enable"]
+        assert "111111111111" not in result["disable"]
+
+    def test_hysteresis_band_enables_below_re_enable_threshold(self):
+        """Account below re_enable_threshold (well under both) gets enabled."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "222222222222", "estimated_discount_benefit": 50.0},
+        ]
+        account_thresholds = {"222222222222": Decimal("120")}
+        account_re_enable_thresholds = {"222222222222": Decimal("80")}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds, account_re_enable_thresholds
+        )
+
+        assert "222222222222" in result["enable"]
+        assert "222222222222" not in result["disable"]
+
+    def test_hysteresis_band_disables_above_disable_threshold(self):
+        """Account above disable_threshold gets disabled even with hysteresis."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "333333333333", "estimated_discount_benefit": 150.0},
+        ]
+        account_thresholds = {"333333333333": Decimal("120")}
+        account_re_enable_thresholds = {"333333333333": Decimal("80")}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds, account_re_enable_thresholds
+        )
+
+        assert "333333333333" in result["disable"]
+        assert "333333333333" not in result["enable"]
+
+    def test_no_re_enable_thresholds_backward_compatible(self):
+        """When account_re_enable_thresholds is None, behavior is identical to v1.0."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "444444444444", "estimated_discount_benefit": 80.0},
+            {"account_id": "555555555555", "estimated_discount_benefit": 130.0},
+        ]
+        account_thresholds = {
+            "444444444444": Decimal("100"),
+            "555555555555": Decimal("100"),
+        }
+
+        result = enforcement.determine_enforcement_actions(per_account_usage, account_thresholds)
+
+        assert "444444444444" in result["enable"]
+        assert "555555555555" in result["disable"]
+
+
 class TestUpdateRispSharingGroups:
     """Test update_risp_sharing_groups function."""
 
