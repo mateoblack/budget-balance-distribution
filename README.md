@@ -53,6 +53,25 @@ Budget Balanced Distribution automatically monitors AWS account spending and enf
 └─────────────────────────────────────────────┘
 ```
 
+## Phase A / Phase B Deployment Model
+
+The system ships with two operational modes separated by an explicit activation gate.
+
+**Phase A (Read-Only Discovery)** is the default state. The Discovery Lambda runs daily at 2:00 AM UTC, analyzes discount consumption across all configured accounts, calculates fair-share thresholds, and writes `proposed_changes.json` to S3. All findings are logged to CloudWatch. No writes are made to Cost Categories. Phase A is safe to run indefinitely — there is no risk of accidentally disabling RISP sharing.
+
+**Phase B (Enforcement)** is activated by enabling the `EnforcementExecuteSchedule` EventBridge rule in the AWS Console. When enabled, this rule passes `{"execute": true}` to the Enforcement Lambda at 2:30 AM UTC, enabling actual Cost Category writes that disable RISP sharing for over-budget accounts.
+
+### Phase B Enablement Checklist
+
+Complete all steps before enabling Phase B enforcement:
+
+1. Review at least 3 consecutive days of `proposed_changes/latest.json` in S3 — confirm the disable/enable decisions look correct for your accounts
+2. Subscribe to the SNS alert topic and verify you receive test notifications (see Monitoring section)
+3. Check the CloudWatch dashboard shows metrics from Discovery Lambda runs (account counts, threshold violations)
+4. Query the DynamoDB audit table and verify dry-run records exist with correct account IDs
+5. Review the rollback runbook (`docs/runbooks/enforcement-rollback.md`) so you know the recovery procedure if enforcement misfires
+6. Enable the `EnforcementExecuteSchedule` EventBridge rule in AWS Console — the rule name is in CloudFormation outputs as `EnforcementExecuteRuleName`
+
 ## Quick Start
 
 ### Prerequisites
@@ -68,6 +87,7 @@ Budget Balanced Distribution automatically monitors AWS account spending and enf
 # 1. Install dependencies
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
+pip install -r requirements-cli.txt      # CLI tool dependencies (required before CLI commands)
 
 # 2. Set Cost Category ARN (required)
 export COST_CATEGORY_ARN="arn:aws:ce::123456789012:costcategory/12345678-1234-1234-1234-123456789012"
@@ -464,6 +484,11 @@ A: Enforcement Lambda checks compliance daily at 2:30 AM UTC. Re-enablement is e
 **Q: "Billing APIs require us-east-1" error**
 
 A: All Cost Explorer and Organizations APIs must run from commercial partition (us-east-1), even when managing GovCloud workloads. Deploy this stack to us-east-1.
+
+## Documentation
+
+- [GovCloud Billing Architecture](docs/architecture/govcloud-billing-model.md) — Why billing APIs run from commercial partition for GovCloud workloads, account pairing model, ARN format requirements
+- [Enforcement Rollback Runbook](docs/runbooks/enforcement-rollback.md) — Recovery procedure if enforcement misfires, with < 15 minute restoration path
 
 ## License
 
