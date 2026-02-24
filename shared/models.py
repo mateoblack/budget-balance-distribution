@@ -130,6 +130,23 @@ class ThresholdConfig(BaseModel):
     threshold_type: Literal["absolute", "percentage", "fair_share"] = Field(..., description="Type of threshold")
     absolute_amount: Optional[Decimal] = Field(None, description="Fixed dollar amount (for absolute type)")
     percentage_value: Optional[Decimal] = Field(None, description="Percentage of group budget (for percentage type)")
+    re_enable_threshold_pct: Optional[Decimal] = Field(
+        None,
+        description=(
+            "Re-enable threshold as % of fair share (default: same as threshold). "
+            "If set lower than threshold, creates a hysteresis band to prevent oscillation. "
+            "Example: threshold=120%, re_enable=80% means disable at 120% and only re-enable at 80%."
+        )
+    )
+    fairness_metric: Literal["combined", "ri_only", "sp_only"] = Field(
+        default="combined",
+        description=(
+            "Which discount metric to use for fairness comparison. "
+            "'combined' = total RI+SP benefit (default, current behavior). "
+            "'sp_only' = Savings Plans benefit only (per-account attribution available). "
+            "'ri_only' = Reserved Instance benefit only (per-account attribution approximate)."
+        )
+    )
     created_at: str = Field(..., description="ISO 8601 timestamp of creation")
     updated_at: str = Field(..., description="ISO 8601 timestamp of last update")
 
@@ -148,6 +165,14 @@ class ThresholdConfig(BaseModel):
         if v is not None:
             if v < 0 or v > 100:
                 raise ValueError("percentage_value must be between 0 and 100")
+        return v
+
+    @field_validator("re_enable_threshold_pct")
+    @classmethod
+    def validate_re_enable_threshold_pct(cls, v: Optional[Decimal]) -> Optional[Decimal]:
+        """Validate re_enable_threshold_pct is positive when provided."""
+        if v is not None and v <= 0:
+            raise ValueError("re_enable_threshold_pct must be greater than 0")
         return v
 
     @model_validator(mode="after")
@@ -182,6 +207,10 @@ class ThresholdConfig(BaseModel):
             item["absolute_amount"] = str(self.absolute_amount)
         if self.percentage_value is not None:
             item["percentage_value"] = str(self.percentage_value)
+        if self.re_enable_threshold_pct is not None:
+            item["re_enable_threshold_pct"] = str(self.re_enable_threshold_pct)
+        if self.fairness_metric != "combined":
+            item["fairness_metric"] = self.fairness_metric
 
         return item
 
@@ -194,6 +223,8 @@ class ThresholdConfig(BaseModel):
             threshold_type=item["threshold_type"],
             absolute_amount=Decimal(item["absolute_amount"]) if "absolute_amount" in item else None,
             percentage_value=Decimal(item["percentage_value"]) if "percentage_value" in item else None,
+            re_enable_threshold_pct=Decimal(item["re_enable_threshold_pct"]) if "re_enable_threshold_pct" in item else None,
+            fairness_metric=item.get("fairness_metric", "combined"),
             created_at=item["created_at"],
             updated_at=item["updated_at"],
         )
