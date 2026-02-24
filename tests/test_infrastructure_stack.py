@@ -164,6 +164,7 @@ def test_cfn_outputs_exist(template):
         "EnforcementScheduleArn",
         "EnforcementExecuteRuleName",
         "ProductionEnablementChecklist",
+        "PlanArtifactBucketName",
     ]
 
     output_keys = list(outputs.keys())
@@ -214,13 +215,13 @@ def test_enforcement_role_has_cost_category_access(template):
 
 
 def test_discovery_lambda_created(template):
-    """Verify Discovery Lambda exists with Python 3.12 runtime, 512MB memory, and 5min timeout."""
+    """Verify Discovery Lambda exists with Python 3.12 runtime, 512MB memory, and 10min timeout."""
     template.has_resource_properties(
         "AWS::Lambda::Function",
         Match.object_like({
             "Runtime": "python3.12",
             "MemorySize": 512,
-            "Timeout": 300,  # 5 minutes in seconds
+            "Timeout": 600,  # 10 minutes in seconds
         })
     )
 
@@ -239,6 +240,7 @@ def test_discovery_lambda_environment_variables(template):
                     "LOOKBACK_DAYS": "30",
                     "THRESHOLD_PCT": "120",
                     "DRY_RUN": "true",
+                    "PLAN_ARTIFACT_BUCKET": Match.any_value(),
                 })
             })
         })
@@ -294,14 +296,14 @@ def test_discovery_lambda_log_retention(template):
 
 
 def test_enforcement_lambda_created(template):
-    """Verify Enforcement Lambda exists with Python 3.12 runtime, 512MB memory, and 5min timeout."""
+    """Verify Enforcement Lambda exists with Python 3.12 runtime, 512MB memory, and 10min timeout."""
     # Match on POWERTOOLS_SERVICE_NAME=enforcement to distinguish from discovery
     template.has_resource_properties(
         "AWS::Lambda::Function",
         Match.object_like({
             "Runtime": "python3.12",
             "MemorySize": 512,
-            "Timeout": 300,  # 5 minutes in seconds
+            "Timeout": 600,  # 10 minutes in seconds
             "Environment": Match.object_like({
                 "Variables": Match.object_like({
                     "POWERTOOLS_SERVICE_NAME": "enforcement",
@@ -324,6 +326,7 @@ def test_enforcement_lambda_environment_variables(template):
                     "POWERTOOLS_SERVICE_NAME": "enforcement",
                     "POWERTOOLS_LOG_LEVEL": "INFO",
                     "DRY_RUN": "true",
+                    "PLAN_ARTIFACT_BUCKET": Match.any_value(),
                 })
             })
         })
@@ -403,6 +406,50 @@ def test_enforcement_lambda_log_retention(template):
             "RetentionInDays": 30,
         })
     )
+
+
+# ========== Plan Artifact S3 Bucket Tests (Phase 8, Plan 01-01) ==========
+
+def test_plan_artifact_bucket_created(template):
+    """Verify plan artifact S3 bucket has versioning, encryption, and lifecycle rules."""
+    template.has_resource_properties(
+        "AWS::S3::Bucket",
+        Match.object_like({
+            "VersioningConfiguration": {"Status": "Enabled"},
+            "BucketEncryption": Match.object_like({
+                "ServerSideEncryptionConfiguration": Match.array_with([
+                    Match.object_like({
+                        "ServerSideEncryptionByDefault": Match.object_like({
+                            "SSEAlgorithm": "AES256"
+                        })
+                    })
+                ])
+            }),
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "BlockPublicPolicy": True,
+                "IgnorePublicAcls": True,
+                "RestrictPublicBuckets": True,
+            },
+        })
+    )
+
+
+def test_plan_artifact_bucket_retain_policy(template):
+    """Verify plan artifact S3 bucket has DeletionPolicy: Retain."""
+    buckets = template.find_resources("AWS::S3::Bucket")
+    assert len(buckets) >= 1, "Expected at least 1 S3 bucket"
+    retain_count = sum(
+        1 for r in buckets.values()
+        if r.get("DeletionPolicy") == "Retain"
+    )
+    assert retain_count >= 1, "Expected at least one S3 bucket with DeletionPolicy: Retain"
+
+
+def test_plan_artifact_bucket_output_exists(template):
+    """Verify PlanArtifactBucketName is in CloudFormation outputs."""
+    outputs = template.find_outputs("*")
+    assert "PlanArtifactBucketName" in outputs, "Missing PlanArtifactBucketName output"
 
 
 # ========== Monitoring Infrastructure Tests (Phase 6) ==========
@@ -496,8 +543,8 @@ def test_discovery_lambda_duration_alarm_created(template):
         "AWS::CloudWatch::Alarm",
         Match.object_like({
             "AlarmName": "BudgetBalanceDistribution-DiscoveryLambdaDuration",
-            "AlarmDescription": "Discovery Lambda duration approaching timeout (>240s of 300s)",
-            "Threshold": 240000,  # milliseconds
+            "AlarmDescription": "Discovery Lambda duration approaching timeout (>510s of 600s)",
+            "Threshold": 510000,  # 510 seconds in milliseconds (85% of 10min)
             "ComparisonOperator": "GreaterThanOrEqualToThreshold",
         })
     )
@@ -509,8 +556,8 @@ def test_enforcement_lambda_duration_alarm_created(template):
         "AWS::CloudWatch::Alarm",
         Match.object_like({
             "AlarmName": "BudgetBalanceDistribution-EnforcementLambdaDuration",
-            "AlarmDescription": "Enforcement Lambda duration approaching timeout (>240s of 300s)",
-            "Threshold": 240000,  # milliseconds
+            "AlarmDescription": "Enforcement Lambda duration approaching timeout (>510s of 600s)",
+            "Threshold": 510000,  # 510 seconds in milliseconds (85% of 10min)
             "ComparisonOperator": "GreaterThanOrEqualToThreshold",
         })
     )
