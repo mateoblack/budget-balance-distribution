@@ -1,5 +1,6 @@
 """Enforcement audit record persistence for DynamoDB."""
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ def write_enforcement_audit_record(
     effective_start: Optional[str] = None,
     error_message: Optional[str] = None,
     previous_state: Optional[dict] = None,
+    data_as_of: str = "",
 ) -> dict:
     """
     Write immutable enforcement audit record to DynamoDB.
@@ -36,6 +38,8 @@ def write_enforcement_audit_record(
         effective_start: AWS effective start timestamp (execute-success only)
         error_message: Error details (execute-error only)
         previous_state: Dict with "enabled" and "disabled" account lists (execute mode only)
+        data_as_of: Freshness date of CE billing data used for this enforcement run (YYYY-MM-DD).
+            Empty string when unknown. Propagated from S3 artifact or CE fallback conservative bound.
 
     Returns:
         The audit record dict that was written
@@ -52,7 +56,17 @@ def write_enforcement_audit_record(
         "enabled_accounts": enable_list,
         "disabled_accounts": disable_list,
         "executed_at": timestamp,
+        "data_as_of": data_as_of,  # Freshness timestamp of CE billing data used for this enforcement run
     }
+
+    # Compute data_age_hours when data_as_of is provided (aids human readability and CloudWatch alarming)
+    if data_as_of:
+        try:
+            data_as_of_dt = datetime.fromisoformat(data_as_of + "T00:00:00+00:00")
+            data_age_hours = int((datetime.now(timezone.utc) - data_as_of_dt).total_seconds() / 3600)
+            audit_record["data_age_hours"] = data_age_hours
+        except (ValueError, TypeError):
+            pass  # Don't fail audit write if data_as_of is malformed
 
     # Add execute-success specific fields
     if snapshot_id:
