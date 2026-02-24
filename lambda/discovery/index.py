@@ -20,6 +20,7 @@ REQUIRED IAM PERMISSIONS:
   - ce:DescribeCostCategoryDefinition
   - dynamodb:PutItem, GetItem, UpdateItem, DeleteItem (for idempotency)
   - sns:Publish (optional, for alerts)
+  - s3:PutObject (optional, for plan artifact)
 
 ENVIRONMENT VARIABLES:
   - CONFIG_TABLE_NAME: DynamoDB table for configuration
@@ -28,6 +29,7 @@ ENVIRONMENT VARIABLES:
   - THRESHOLD_PCT: Alert threshold as % of fair share (default: 120)
   - DRY_RUN: Set to "false" to enable SNS publishing (default: "true")
   - SNS_TOPIC_ARN: (Optional) SNS topic for alerts
+  - PLAN_ARTIFACT_BUCKET: (Optional) S3 bucket for proposed_changes artifact
   - POWERTOOLS_SERVICE_NAME: Service name for logging (default: "discovery")
   - POWERTOOLS_LOG_LEVEL: Logging level (default: "INFO")
 """
@@ -40,6 +42,8 @@ from typing import Any
 import boto3
 from botocore.config import Config
 from aws_lambda_powertools import Logger
+from aws_lambda_powertools.metrics import MetricUnit
+from aws_lambda_powertools import Metrics
 from aws_lambda_powertools.utilities.idempotency import (
     DynamoDBPersistenceLayer,
     IdempotencyConfig,
@@ -51,6 +55,7 @@ from aws_lambda_powertools.utilities.idempotency import (
 # ---------------------------------------------------------------------------
 
 logger = Logger(service="discovery")
+metrics = Metrics(namespace="BudgetBalanceDistribution")
 
 # Boto3 config for all clients: explicit region, timeouts, adaptive retries
 boto_config = Config(
@@ -97,6 +102,7 @@ CONFIG_TABLE_NAME = os.environ.get("CONFIG_TABLE_NAME", "")
 AUDIT_TABLE_NAME = os.environ.get("AUDIT_TABLE_NAME", "")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+PLAN_ARTIFACT_BUCKET = os.environ.get("PLAN_ARTIFACT_BUCKET", "")
 
 
 # ---------------------------------------------------------------------------
@@ -284,13 +290,16 @@ def get_sp_utilization(start_date: str, end_date: str) -> dict:
 
 def get_per_account_discount_usage(
     start_date: str, end_date: str
-) -> list[dict]:
+) -> tuple[list[dict], list]:
     """
     Get per-account cost breakdown showing how much each account
     is consuming in discounted vs on-demand rates.
 
     Uses LINKED_ACCOUNT grouping with multiple metrics to show
     the blended vs unblended cost delta (which reveals discount flow).
+
+    Returns a tuple of (usage_list, results_by_time) where results_by_time
+    is the raw CE ResultsByTime list used for data freshness detection.
     """
     ce_client = _get_client("ce")
 
@@ -309,12 +318,13 @@ def get_per_account_discount_usage(
             ],
         )
 
+        results_by_time = response.get("ResultsByTime", [])
         accounts = {}
 
-        for period in response.get("ResultsByTime", []):
+        for period in results_by_time:
             for group in period.get("Groups", []):
                 account_id = group["Keys"][0]
-                metrics = group["Metrics"]
+                metrics_data = group["Metrics"]
 
                 if account_id not in accounts:
                     accounts[account_id] = {
@@ -326,16 +336,16 @@ def get_per_account_discount_usage(
                     }
 
                 accounts[account_id]["unblended_cost"] += float(
-                    metrics.get("UnblendedCost", {}).get("Amount", "0")
+                    metrics_data.get("UnblendedCost", {}).get("Amount", "0")
                 )
                 accounts[account_id]["blended_cost"] += float(
-                    metrics.get("BlendedCost", {}).get("Amount", "0")
+                    metrics_data.get("BlendedCost", {}).get("Amount", "0")
                 )
                 accounts[account_id]["net_unblended_cost"] += float(
-                    metrics.get("NetUnblendedCost", {}).get("Amount", "0")
+                    metrics_data.get("NetUnblendedCost", {}).get("Amount", "0")
                 )
                 accounts[account_id]["amortized_cost"] += float(
-                    metrics.get("AmortizedCost", {}).get("Amount", "0")
+                    metrics_data.get("AmortizedCost", {}).get("Amount", "0")
                 )
 
         # Compute discount benefit: difference between what they'd pay
@@ -358,7 +368,7 @@ def get_per_account_discount_usage(
                 "total_discount_pool": total_discount_pool
             }
         )
-        return result
+        return result, results_by_time
 
     except Exception as e:
         logger.error("Failed to get per-account discount usage", extra={"error": str(e)})
@@ -371,10 +381,13 @@ def get_per_account_discount_usage(
 
 def get_sp_utilization_by_account(
     start_date: str, end_date: str
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, float]]:
     """
     Get Savings Plans utilization broken down by account.
     This shows which accounts are actually consuming SP benefits.
+
+    Returns a tuple of (details_list, sp_by_account_dict) where
+    sp_by_account_dict maps account_id -> total net_savings.
     """
     ce_client = _get_client("ce")
 
@@ -406,15 +419,21 @@ def get_sp_utilization_by_account(
                 "net_savings": float(savings.get("NetSavings", "0")),
             })
 
+        # Build per-account SP benefit map (sum net_savings per account)
+        sp_by_account: dict[str, float] = {}
+        for detail in results:
+            acct_id = detail["account_id"]
+            sp_by_account[acct_id] = sp_by_account.get(acct_id, 0.0) + detail["net_savings"]
+
         logger.info(
             "SP utilization details retrieved",
             extra={"savings_plan_count": len(results)}
         )
-        return results
+        return results, sp_by_account
 
     except ce_client.exceptions.DataUnavailableException:
         logger.warning("SP utilization details not available")
-        return []
+        return [], {}  # (empty results list, empty sp_by_account dict)
     except Exception as e:
         logger.error("Failed to get SP utilization details", extra={"error": str(e)})
         raise
@@ -467,6 +486,37 @@ def get_existing_cost_categories() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Data Freshness Detection
+# ---------------------------------------------------------------------------
+
+def determine_data_freshness(results_by_time: list) -> str:
+    """
+    Estimate the freshest date for which Cost Explorer has complete billing data.
+
+    CE refreshes billing data at least once every 24 hours, up to 3x daily.
+    The safest bound is to find the last period with non-zero cost data.
+    If no populated periods found, falls back to yesterday as a conservative estimate.
+
+    Args:
+        results_by_time: The ResultsByTime list from ce:GetCostAndUsage response
+
+    Returns:
+        ISO date string (YYYY-MM-DD) of the freshest data point
+    """
+    populated = [
+        p for p in results_by_time
+        if any(
+            float(g.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", "0")) > 0
+            for g in p.get("Groups", [])
+        )
+    ]
+    if populated:
+        return populated[-1]["TimePeriod"]["End"]
+    # Conservative fallback: yesterday
+    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
 # Fair Share Analysis
 # ---------------------------------------------------------------------------
 
@@ -474,11 +524,15 @@ def compute_fair_share_analysis(
     accounts: list[dict],
     per_account_usage: list[dict],
     threshold_pct: float = THRESHOLD_PCT,
+    sp_by_account: dict[str, float] | None = None,
 ) -> dict:
     """
     Given N accounts and the total discount pool Z, compute:
       fair_share = Z / N
       flag any account consuming > threshold_pct% of fair_share
+
+    Includes drain_score (benefit / fair_share, guarded against division by zero),
+    ri_benefit (approximate RI attribution), and sp_benefit (per-account SP benefit).
 
     Returns a report with flagged accounts and recommendations.
     """
@@ -516,14 +570,28 @@ def compute_fair_share_analysis(
         benefit = usage["estimated_discount_benefit"]
         pct_of_fair = (benefit / fair_share * 100) if fair_share > 0 else 0
 
+        sp_benefit = (sp_by_account or {}).get(acct_id, 0.0)
+        # RI benefit is total benefit minus SP benefit (approximate attribution)
+        ri_benefit = max(benefit - sp_benefit, 0.0)
+        drain_score = round(benefit / fair_share, 4) if fair_share > 0 else 0.0
+
         entry = {
             "account_id": acct_id,
             "account_name": account_names.get(acct_id, "UNKNOWN"),
             "discount_benefit": round(benefit, 2),
             "fair_share": round(fair_share, 2),
             "pct_of_fair_share": round(pct_of_fair, 1),
+            "drain_score": drain_score,           # normalized score vs fair share
+            "ri_benefit": round(ri_benefit, 2),   # approximate RI attribution
+            "sp_benefit": round(sp_benefit, 2),   # per-account SP benefit
             "over_threshold": benefit > threshold_amount,
         }
+
+        # Emit drain_score as CloudWatch metric for CloudWatch alarms/dashboards
+        metrics.add_metric(name="DrainScore", unit=MetricUnit.Count, value=drain_score)
+        metrics.add_metadata(key="account_id", value=acct_id)
+        metrics.flush_metrics()  # Flush per account to preserve dimension values
+
         all_accounts_report.append(entry)
 
         if benefit > threshold_amount:
@@ -650,6 +718,82 @@ def publish_alert(report: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Plan Artifact (S3 write for human review before enforcement)
+# ---------------------------------------------------------------------------
+
+def write_plan_artifact(report: dict, data_as_of: str) -> str:
+    """
+    Write proposed changes to S3 for human review before enforcement.
+
+    Writes two objects:
+    1. Timestamped: proposed_changes/{YYYY-MM-DD}/{timestamp}.json (permanent record)
+    2. Stable: proposed_changes/latest.json (what Enforcement Lambda reads)
+
+    Safe to skip if PLAN_ARTIFACT_BUCKET is not set (e.g., pre-S3-bucket deployments).
+
+    Returns the timestamped S3 key, or empty string if skipped.
+
+    Pitfall: Write timestamped key first, then latest.json. If concurrent invocations
+    happen, idempotency (already in place) prevents duplicate Discovery runs.
+    """
+    if not PLAN_ARTIFACT_BUCKET:
+        logger.warning("PLAN_ARTIFACT_BUCKET not set — skipping plan artifact write")
+        return ""
+
+    s3_client = boto3.client("s3", config=boto_config)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    artifact = {
+        "generated_at": timestamp,
+        "data_as_of": data_as_of,
+        "analysis_window_start": report.get("analysis_window_start", ""),
+        "analysis_window_end": report.get("analysis_window_end", ""),
+        "total_discount_pool": report.get("total_discount_pool", 0),
+        "fair_share_per_account": report.get("fair_share_per_account", 0),
+        "n_accounts": report.get("n_accounts", 0),
+        "threshold_pct": report.get("threshold_pct", 0),
+        "proposed_disables": [
+            a["account_id"] for a in report.get("flagged_accounts", [])
+        ],
+        "proposed_enables": [
+            a["account_id"] for a in report.get("all_accounts", [])
+            if not a.get("over_threshold", False)
+        ],
+        "accounts": report.get("all_accounts", []),
+    }
+
+    artifact_json = json.dumps(artifact, indent=2, default=str)
+
+    # Write timestamped version first (permanent record, avoids overwrite race)
+    timestamped_key = f"proposed_changes/{timestamp[:10]}/{timestamp}.json"
+    s3_client.put_object(
+        Bucket=PLAN_ARTIFACT_BUCKET,
+        Key=timestamped_key,
+        Body=artifact_json,
+        ContentType="application/json",
+    )
+
+    # Write stable "latest" pointer (what Enforcement Lambda reads)
+    s3_client.put_object(
+        Bucket=PLAN_ARTIFACT_BUCKET,
+        Key="proposed_changes/latest.json",
+        Body=artifact_json,
+        ContentType="application/json",
+    )
+
+    logger.info(
+        "Plan artifact written to S3",
+        extra={
+            "bucket": PLAN_ARTIFACT_BUCKET,
+            "timestamped_key": timestamped_key,
+            "proposed_disable_count": len(artifact["proposed_disables"]),
+            "proposed_enable_count": len(artifact["proposed_enables"]),
+        }
+    )
+    return timestamped_key
+
+
+# ---------------------------------------------------------------------------
 # Lambda Handler
 # ---------------------------------------------------------------------------
 
@@ -697,19 +841,42 @@ def lambda_handler(event: dict, context: Any) -> dict:
     sp_util = get_sp_utilization(start_date, end_date)
 
     # --- Step 4: Per-Account Discount Consumption ---
-    per_account = get_per_account_discount_usage(start_date, end_date)
+    per_account, results_by_time = get_per_account_discount_usage(start_date, end_date)
+
+    # Determine data freshness from CE results
+    data_as_of = determine_data_freshness(results_by_time)
+    data_age_hours = int(
+        (datetime.now(timezone.utc) - datetime.fromisoformat(data_as_of + "T00:00:00+00:00")).total_seconds() / 3600
+    )
 
     # --- Step 5: SP Details by Account ---
-    sp_details = get_sp_utilization_by_account(start_date, end_date)
+    sp_details, sp_by_account = get_sp_utilization_by_account(start_date, end_date)
 
     # --- Step 6: Existing Cost Categories ---
     cost_categories = get_existing_cost_categories()
 
     # --- Step 7: Fair Share Analysis ---
-    report = compute_fair_share_analysis(accounts, per_account)
+    report = compute_fair_share_analysis(accounts, per_account, sp_by_account=sp_by_account)
+    report["data_as_of"] = data_as_of
+    report["data_age_hours"] = data_age_hours
 
     # --- Step 8: Publish Alert if needed ---
     publish_alert(report)
+
+    # --- Step 9: Write plan artifact to S3 ---
+    # analysis_window_start and analysis_window_end are available from the time window computation above
+    report["analysis_window_start"] = start_date
+    report["analysis_window_end"] = end_date
+    try:
+        artifact_key = write_plan_artifact(report, data_as_of)
+    except Exception as s3_err:
+        logger.error(
+            "Failed to write plan artifact to S3 — continuing",
+            extra={"error": str(s3_err)}
+        )
+        artifact_key = ""
+    if artifact_key:
+        logger.info("Plan artifact available for review", extra={"s3_key": artifact_key})
 
     # Log full report details to CloudWatch (no size limit)
     logger.info(
@@ -732,7 +899,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
         "Discovery Lambda complete",
         extra={
             "account_count": len(accounts),
-            "flagged_count": report.get('flagged_count', 0)
+            "flagged_count": report.get('flagged_count', 0),
+            "data_as_of": data_as_of,
+            "data_age_hours": data_age_hours,
         }
     )
 
@@ -745,4 +914,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         "flagged_count": report.get("flagged_count", 0),
         "total_discount_pool": report.get("total_discount_pool", 0),
         "fair_share_per_account": report.get("fair_share_per_account", 0),
+        "data_as_of": data_as_of,
+        "data_age_hours": data_age_hours,
+        "artifact_s3_key": artifact_key if artifact_key else None,
     }
