@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import Mock, patch
 from decimal import Decimal
+from datetime import datetime, timezone
 
 
 class TestBuildCostCategoryRules:
@@ -269,6 +270,145 @@ class TestDetermineEnforcementActionsHysteresis:
 
         assert "444444444444" in result["enable"]
         assert "555555555555" in result["disable"]
+
+
+class TestCalendarGate:
+    """Test calendar-based re-enablement gating in determine_enforcement_actions."""
+
+    def _current_month(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _previous_month(self) -> str:
+        now = datetime.now(timezone.utc)
+        if now.month == 1:
+            return f"{now.year - 1}-12"
+        return f"{now.year}-{now.month - 1:02d}"
+
+    def test_calendar_gate_blocks_reenable_in_same_month(self):
+        """Account disabled this month stays out even when consumption is low."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "111111111111", "estimated_discount_benefit": 10.0},
+        ]
+        account_thresholds = {"111111111111": Decimal("100")}
+        disabled_months = {"111111111111": self._current_month()}
+        strategies = {"111111111111": "calendar"}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            account_reenablement_strategies=strategies,
+        )
+
+        assert "111111111111" not in result["enable"]
+        assert "111111111111" not in result["disable"]
+
+    def test_calendar_gate_allows_reenable_in_new_month(self):
+        """Account disabled last month becomes eligible for re-enable in the new month."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "222222222222", "estimated_discount_benefit": 10.0},
+        ]
+        account_thresholds = {"222222222222": Decimal("100")}
+        disabled_months = {"222222222222": self._previous_month()}
+        strategies = {"222222222222": "calendar"}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            account_reenablement_strategies=strategies,
+        )
+
+        assert "222222222222" in result["enable"]
+        assert "222222222222" not in result["disable"]
+
+    def test_consumption_strategy_ignores_disabled_month(self):
+        """Account with consumption strategy re-enables based only on threshold, not calendar."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "333333333333", "estimated_discount_benefit": 10.0},
+        ]
+        account_thresholds = {"333333333333": Decimal("100")}
+        disabled_months = {"333333333333": self._current_month()}
+        strategies = {"333333333333": "consumption"}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            account_reenablement_strategies=strategies,
+        )
+
+        # Consumption strategy ignores calendar — account re-enables based on threshold only
+        assert "333333333333" in result["enable"]
+        assert "333333333333" not in result["disable"]
+
+    def test_no_disabled_month_record_allows_reenable(self):
+        """Account with no disable state record is not calendar-blocked."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "444444444444", "estimated_discount_benefit": 10.0},
+        ]
+        account_thresholds = {"444444444444": Decimal("100")}
+        # No entry in disabled_months for this account
+        disabled_months = {}
+        strategies = {"444444444444": "calendar"}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            account_reenablement_strategies=strategies,
+        )
+
+        assert "444444444444" in result["enable"]
+
+    def test_calendar_gate_does_not_affect_disable_decisions(self):
+        """Calendar gate only applies to re-enable candidates, not new disables."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "555555555555", "estimated_discount_benefit": 200.0},
+        ]
+        account_thresholds = {"555555555555": Decimal("100")}
+        disabled_months = {"555555555555": self._current_month()}
+        strategies = {"555555555555": "calendar"}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            account_reenablement_strategies=strategies,
+        )
+
+        # Still gets disabled — calendar gate doesn't protect over-threshold accounts
+        assert "555555555555" in result["disable"]
+        assert "555555555555" not in result["enable"]
+
+    def test_default_strategy_is_calendar_when_no_strategies_passed(self):
+        """When no strategies dict is passed, all accounts default to calendar gating."""
+        import importlib
+        enforcement = importlib.import_module('lambda.enforcement.enforcement')
+
+        per_account_usage = [
+            {"account_id": "666666666666", "estimated_discount_benefit": 10.0},
+        ]
+        account_thresholds = {"666666666666": Decimal("100")}
+        disabled_months = {"666666666666": self._current_month()}
+
+        result = enforcement.determine_enforcement_actions(
+            per_account_usage, account_thresholds,
+            disabled_months=disabled_months,
+            # account_reenablement_strategies not passed → default "calendar"
+        )
+
+        assert "666666666666" not in result["enable"]
 
 
 class TestUpdateRispSharingGroups:

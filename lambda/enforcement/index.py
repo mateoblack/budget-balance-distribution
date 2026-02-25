@@ -54,9 +54,15 @@ from enforcement import determine_enforcement_actions
 from shared.config_loader import (
     load_all_config,
     get_account_thresholds,
+    get_account_reenablement_strategies,
     ConfigValidationError,
 )
-from audit import write_enforcement_audit_record
+from audit import (
+    write_enforcement_audit_record,
+    write_account_disable_state,
+    clear_account_disable_state,
+    load_disabled_months,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level setup (connection reuse across warm Lambda invocations)
@@ -368,8 +374,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "message": error_msg
         }
 
-    # --- Step 2: Calculate account thresholds ---
+    # --- Step 2: Calculate account thresholds and reenablement strategies ---
     account_thresholds = get_account_thresholds(config)
+    account_reenablement_strategies = get_account_reenablement_strategies(config)
     logger.info(
         "Account thresholds calculated",
         extra={"account_threshold_count": len(account_thresholds)}
@@ -430,9 +437,21 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "message": warning_msg
         }
 
+    # Create DynamoDB resource once — used for both disable-state reads and audit writes
+    dynamodb_resource = boto3.resource("dynamodb", config=boto_config)
+    audit_table = dynamodb_resource.Table(AUDIT_TABLE_NAME)
+
+    # Load per-account disable state for calendar-based re-enable gating
+    disabled_months = load_disabled_months(
+        audit_table, [a["account_id"] for a in per_account_usage]
+    )
+
     # --- Step 4: Determine enforcement actions ---
     enforcement_actions = determine_enforcement_actions(
-        per_account_usage, account_thresholds
+        per_account_usage,
+        account_thresholds,
+        disabled_months=disabled_months,
+        account_reenablement_strategies=account_reenablement_strategies,
     )
     enable_list = enforcement_actions["enable"]
     disable_list = enforcement_actions["disable"]
@@ -468,10 +487,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
         )
 
         # Write dry-run audit record to DynamoDB (AUDIT-02, AUDIT-03)
-        dynamodb_resource = boto3.resource("dynamodb", config=boto_config)
-        audit_tbl = dynamodb_resource.Table(AUDIT_TABLE_NAME)
         write_enforcement_audit_record(
-            audit_table=audit_tbl,
+            audit_table=audit_table,
             timestamp=timestamp,
             dry_run=True,
             cost_category_arn=COST_CATEGORY_ARN,
@@ -493,8 +510,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     # Step 6b: Execute mode
     ce_client = _get_client("ce")
-    dynamodb = boto3.resource("dynamodb", config=boto_config)
-    audit_table = dynamodb.Table(AUDIT_TABLE_NAME)
 
     try:
         # Capture snapshot before modification
@@ -543,6 +558,13 @@ def lambda_handler(event: dict, context: Any) -> dict:
             previous_state=previous_state,
             data_as_of=data_as_of,
         )
+
+        # Update per-account disable state for calendar-based re-enable tracking
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        for account_id in disable_list:
+            write_account_disable_state(audit_table, account_id, current_month, timestamp)
+        for account_id in enable_list:
+            clear_account_disable_state(audit_table, account_id)
 
         return {
             "status": "EXECUTED",

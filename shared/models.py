@@ -147,6 +147,16 @@ class ThresholdConfig(BaseModel):
             "'ri_only' = Reserved Instance benefit only (per-account attribution approximate)."
         )
     )
+    reenablement_strategy: Literal["calendar", "consumption"] = Field(
+        default="calendar",
+        description=(
+            "Re-enablement strategy for accounts that exceed their threshold. "
+            "'calendar' (default) keeps accounts disabled for the remainder of the billing "
+            "month they were disabled in, matching the monthly fair-share allocation model. "
+            "'consumption' re-enables based solely on the re_enable_threshold comparison "
+            "(original behavior — accounts can re-enter the pool mid-month if daily spend dips)."
+        )
+    )
     created_at: str = Field(..., description="ISO 8601 timestamp of creation")
     updated_at: str = Field(..., description="ISO 8601 timestamp of last update")
 
@@ -211,6 +221,8 @@ class ThresholdConfig(BaseModel):
             item["re_enable_threshold_pct"] = str(self.re_enable_threshold_pct)
         if self.fairness_metric != "combined":
             item["fairness_metric"] = self.fairness_metric
+        if self.reenablement_strategy != "calendar":
+            item["reenablement_strategy"] = self.reenablement_strategy
 
         return item
 
@@ -225,6 +237,7 @@ class ThresholdConfig(BaseModel):
             percentage_value=Decimal(item["percentage_value"]) if "percentage_value" in item else None,
             re_enable_threshold_pct=Decimal(item["re_enable_threshold_pct"]) if "re_enable_threshold_pct" in item else None,
             fairness_metric=item.get("fairness_metric", "combined"),
+            reenablement_strategy=item.get("reenablement_strategy", "calendar"),
             created_at=item["created_at"],
             updated_at=item["updated_at"],
         )

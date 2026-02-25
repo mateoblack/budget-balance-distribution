@@ -244,3 +244,49 @@ def get_account_thresholds(config: dict) -> dict[str, Decimal]:
 
     logger.info(f"Calculated thresholds for {len(account_thresholds)} active accounts")
     return account_thresholds
+
+
+def get_account_reenablement_strategies(config: dict) -> dict[str, str]:
+    """
+    Derive the effective reenablement strategy for each active account.
+
+    Most-restrictive wins: if any threshold governing an account uses "calendar",
+    the account gets "calendar". An account only gets "consumption" when every
+    threshold across all of its group memberships explicitly opts in to "consumption".
+
+    Args:
+        config: Dictionary with 'groups', 'accounts', 'thresholds' keys
+
+    Returns:
+        Dictionary mapping account_id -> "calendar" or "consumption".
+        Only includes active accounts.
+    """
+    accounts = config["accounts"]
+    thresholds = config["thresholds"]
+
+    # Build group_id -> list of ThresholdConfig
+    group_thresholds: dict[str, list] = {}
+    for t in thresholds:
+        group_thresholds.setdefault(t.group_id, []).append(t)
+
+    strategies = {}
+    for account in accounts:
+        if not account.active:
+            continue
+        # Collect strategies from every threshold in every group this account belongs to
+        account_strategies = set()
+        for group_id in account.group_memberships:
+            for t in group_thresholds.get(group_id, []):
+                account_strategies.add(t.reenablement_strategy)
+        # All thresholds must explicitly use "consumption" to opt out of calendar gating
+        if account_strategies and all(s == "consumption" for s in account_strategies):
+            strategies[account.account_id] = "consumption"
+        else:
+            strategies[account.account_id] = "calendar"
+
+    logger.info(
+        "Reenablement strategies derived: %d calendar, %d consumption",
+        sum(1 for s in strategies.values() if s == "calendar"),
+        sum(1 for s in strategies.values() if s == "consumption"),
+    )
+    return strategies

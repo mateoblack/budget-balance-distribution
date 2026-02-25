@@ -92,3 +92,76 @@ def write_enforcement_audit_record(
     )
 
     return audit_record
+
+
+def write_account_disable_state(
+    audit_table,
+    account_id: str,
+    disabled_month: str,
+    disabled_at: str,
+) -> None:
+    """
+    Persist the billing month an account was disabled for calendar-based re-enable gating.
+
+    Called after a successful execute-mode disable. Allows subsequent enforcement
+    runs to know which month each account was disabled in, so calendar-gated accounts
+    stay out for the remainder of the billing cycle.
+
+    Args:
+        audit_table: boto3 DynamoDB Table resource
+        account_id: AWS account ID
+        disabled_month: Billing month the account was disabled (YYYY-MM)
+        disabled_at: ISO 8601 timestamp of the enforcement run that disabled the account
+    """
+    audit_table.put_item(Item={
+        "PK": "ACCOUNT_DISABLE_STATE",
+        "SK": account_id,
+        "account_id": account_id,
+        "disabled_month": disabled_month,
+        "disabled_at": disabled_at,
+        "entity_type": "ACCOUNT_DISABLE_STATE",
+    })
+    logger.debug("Wrote account disable state: %s → %s", account_id, disabled_month)
+
+
+def clear_account_disable_state(audit_table, account_id: str) -> None:
+    """
+    Remove the disable state record for an account that has been re-enabled.
+
+    Called after a successful execute-mode re-enable. Clears the calendar gate
+    so the account can be disabled again if it exceeds its threshold in a future month.
+
+    Args:
+        audit_table: boto3 DynamoDB Table resource
+        account_id: AWS account ID to clear
+    """
+    audit_table.delete_item(Key={"PK": "ACCOUNT_DISABLE_STATE", "SK": account_id})
+    logger.debug("Cleared account disable state for %s", account_id)
+
+
+def load_disabled_months(audit_table, account_ids: list[str]) -> dict[str, str]:
+    """
+    Load the disable month for each account from DynamoDB.
+
+    Used by enforcement logic to apply calendar-based re-enable gating.
+    Only returns entries for accounts that have an active disable state record.
+
+    Args:
+        audit_table: boto3 DynamoDB Table resource
+        account_ids: List of account IDs to look up
+
+    Returns:
+        Dict mapping account_id -> "YYYY-MM" for accounts with a disable state record.
+        Accounts without a record are absent from the result.
+    """
+    result = {}
+    for account_id in account_ids:
+        response = audit_table.get_item(
+            Key={"PK": "ACCOUNT_DISABLE_STATE", "SK": account_id}
+        )
+        item = response.get("Item")
+        if item and "disabled_month" in item:
+            result[account_id] = item["disabled_month"]
+    if result:
+        logger.info("Loaded disable state for %d account(s)", len(result))
+    return result
